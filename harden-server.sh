@@ -343,18 +343,26 @@ disable_password_auth() {
   ok "PasswordAuthentication=no, PermitRootLogin=no (root SSH запрещён)"
 }
 
-ensure_expect() {
-  if command -v expect >/dev/null 2>&1; then
+
+find_xui_binary() {
+  if [[ -x /usr/local/x-ui/x-ui ]]; then
+    echo /usr/local/x-ui/x-ui
     return 0
   fi
-  log "Установка expect..."
-  if command -v apt-get >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq expect >/dev/null
-  else
-    err "Не удалось установить expect (нет apt-get)"
-    return 1
+  if command -v x-ui >/dev/null 2>&1; then
+    # /usr/bin/x-ui is often the menu script; prefer real binary beside it
+    local real
+    real=$(command -v x-ui)
+    if [[ -x /usr/local/x-ui/x-ui ]]; then
+      echo /usr/local/x-ui/x-ui
+    elif file "$real" 2>/dev/null | grep -qi 'elf\|executable'; then
+      echo "$real"
+    else
+      return 1
+    fi
+    return 0
   fi
+  return 1
 }
 
 read_xui_url_hint() {
@@ -364,80 +372,57 @@ read_xui_url_hint() {
     source /etc/x-ui/install-result.env
     XUI_URL="${XUI_ACCESS_URL:-}"
   fi
+  # Fallback: ask binary for port/base path without printing secrets
+  local bin port path
+  bin=$(find_xui_binary 2>/dev/null || true)
+  if [[ -n "$bin" && -z "$XUI_URL" ]]; then
+    # -show may print multiple lines; best-effort parse
+    local shown
+    shown=$("$bin" setting -show 2>/dev/null || true)
+    port=$(printf '%s\n' "$shown" | grep -iE 'port' | head -1 | grep -oE '[0-9]{2,5}' | head -1 || true)
+    path=$(printf '%s\n' "$shown" | grep -iE 'webBasePath|base.?path' | head -1 | awk -F'[=: ]+' '{print $NF}' | tr -d '[:space:]' || true)
+    if [[ -n "$port" ]]; then
+      XUI_URL="https://<SERVER_IP>:${port}/${path#/}"
+    fi
+  fi
+}
+
+restart_xui_panel() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
+    systemctl restart x-ui
+    return $?
+  fi
+  if command -v x-ui >/dev/null 2>&1; then
+    # non-interactive restart if menu script supports it poorly — try systemctl only
+    warn "systemctl unit x-ui не найден — перезапустите панель вручную"
+    return 1
+  fi
+  return 1
 }
 
 reset_xui_credentials() {
   log "Сброс логина/пароля 3x-ui..."
-  if ! command -v x-ui >/dev/null 2>&1; then
-    err "Команда x-ui не найдена — пункт пропущен"
+  local bin
+  bin=$(find_xui_binary) || {
+    err "Бинарник /usr/local/x-ui/x-ui не найден — пункт пропущен"
     return 0
-  fi
-  ensure_expect || return 1
+  }
 
   XUI_USER=$(gen_username)
   while :; do
     XUI_PASS=$(gen_password_60)
-    [[ "$XUI_PASS" != "$ROOT_PASS" && "$XUI_PASS" != "$SYS_PASS" ]] && break
+    [[ "$XUI_PASS" != "${ROOT_PASS:-}" && "$XUI_PASS" != "${SYS_PASS:-}" ]] && break
   done
 
-  # Automate: menu 7 → y → user → pass → y (disable 2FA) → y (restart) → Enter → 0
-  expect <<EOF >/tmp/xui-reset.expect.log 2>&1
-set timeout 120
-log_user 0
-spawn x-ui
-expect {
-  -re {selection|Selection|enter your selection} {}
-  timeout { exit 2 }
-}
-send "7\r"
-expect {
-  -re {sure to reset|username and password|Default n} {}
-  timeout { exit 3 }
-}
-send "y\r"
-expect {
-  -re {login username|username} {}
-  timeout { exit 4 }
-}
-send "${XUI_USER}\r"
-expect {
-  -re {login password|password} {}
-  timeout { exit 5 }
-}
-send "${XUI_PASS}\r"
-expect {
-  -re {two-factor|2FA|two factor|authentication} {}
-  timeout { exit 6 }
-}
-send "y\r"
-expect {
-  -re {Restart the panel|restart|Attention} {}
-  timeout { exit 7 }
-}
-send "y\r"
-expect {
-  -re {Press enter|return to the main menu|main menu} {}
-  timeout {}
-}
-send "\r"
-expect {
-  -re {selection|Selection|enter your selection} {}
-  timeout {}
-}
-send "0\r"
-expect eof
-EOF
-
-  local rc=$?
-  # Log file may contain secrets from expect spawn — wipe it
-  rm -f /tmp/xui-reset.expect.log
-
-  if [[ $rc -ne 0 ]]; then
-    err "Сбой автоматизации x-ui (expect exit=$rc). Сбросьте вручную: x-ui → 7"
+  # Direct CLI (same as x-ui.sh reset_user) — no fragile expect/menu
+  if ! "$bin" setting -username "$XUI_USER" -password "$XUI_PASS" -resetTwoFactor=true >/dev/null 2>&1; then
+    err "Не удалось выполнить: $bin setting -username ... -password ..."
     XUI_USER=""; XUI_PASS=""
     return 1
   fi
 
+  restart_xui_panel || true
+  sleep 1
   read_xui_url_hint
   ok "Учётные данные панели 3x-ui сброшены"
 
