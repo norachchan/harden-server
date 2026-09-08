@@ -127,6 +127,28 @@ has_authorized_keys() {
   grep -Eqv '^\s*(#|$)' "$keys"
 }
 
+# Copy root SSH public keys to system user so key login keeps working
+copy_root_authorized_keys_to_user() {
+  local user="$1" home src="/root/.ssh/authorized_keys" dst_dir dst
+  home=$(getent passwd "$user" | cut -d: -f6 || true)
+  if [[ -z "$home" || ! -d "$home" ]]; then
+    err "Домашняя директория пользователя ${user} не найдена"
+    return 1
+  fi
+  if [[ ! -f "$src" ]] || ! grep -Eqv '^\s*(#|$)' "$src"; then
+    warn "У root нет ${src} — копировать нечего. Добавьте ключ вручную в ${home}/.ssh/authorized_keys"
+    return 1
+  fi
+  dst_dir="${home}/.ssh"
+  dst="${dst_dir}/authorized_keys"
+  mkdir -p "$dst_dir"
+  cp -f "$src" "$dst"
+  chmod 700 "$dst_dir"
+  chmod 600 "$dst"
+  chown -R "${user}:${user}" "$dst_dir"
+  ok "SSH-ключи скопированы: ${src} → ${dst}"
+}
+
 ssh_service_name() {
   if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
     echo ssh
@@ -239,6 +261,9 @@ create_system_user() {
   set_user_password "$SYS_USER" "$SYS_PASS"
   ok "Пароль ${SYS_USER} обновлён"
 
+  # Без этого после отключения root/password SSH вход по ключу ломается
+  copy_root_authorized_keys_to_user "$SYS_USER" || true
+
   if [[ "$RAN_ALL" -eq 0 ]]; then
     print_secret_once_banner
     echo -e "${BOLD}user:${NC}     ${SYS_USER}"
@@ -299,10 +324,15 @@ disable_password_auth() {
     fi
   fi
 
+  # Keys must already be on the system user before locking root out
+  if ! has_authorized_keys "$target_user"; then
+    copy_root_authorized_keys_to_user "$target_user" || true
+  fi
+
   ensure_ssh_setting PasswordAuthentication no
   ensure_ssh_setting KbdInteractiveAuthentication no
   ensure_ssh_setting ChallengeResponseAuthentication no
-  ensure_ssh_setting PermitRootLogin prohibit-password
+  ensure_ssh_setting PermitRootLogin no
   # Pubkey must stay on
   ensure_ssh_setting PubkeyAuthentication yes
 
@@ -310,7 +340,7 @@ disable_password_auth() {
     sshd -t
   fi
   reload_ssh
-  ok "PasswordAuthentication=no, PermitRootLogin=prohibit-password"
+  ok "PasswordAuthentication=no, PermitRootLogin=no (root SSH запрещён)"
 }
 
 ensure_expect() {
