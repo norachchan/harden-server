@@ -150,21 +150,110 @@ copy_root_authorized_keys_to_user() {
 }
 
 ssh_service_name() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^ssh\.service'; then
+  if systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.service'; then
     echo ssh
-  else
+  elif systemctl list-unit-files 2>/dev/null | grep -qE '^sshd\.service'; then
     echo sshd
+  elif systemctl list-units --all 2>/dev/null | grep -qE 'sshd\.service'; then
+    echo sshd
+  else
+    echo ssh
   fi
 }
 
-reload_ssh() {
+ssh_listening_on_port() {
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -tln | awk '{print $4}' | grep -E "[:.]${port}$" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+# Port changes require full restart. Also disable socket activation (ssh.socket),
+# otherwise systemd keeps listening on :22 and ignores Port in sshd_config until reboot.
+disable_ssh_socket_activation() {
+  local sock
+  for sock in ssh.socket sshd.socket; do
+    if systemctl list-unit-files 2>/dev/null | grep -qE "^${sock}"; then
+      log "Отключаю ${sock} (socket activation мешает смене Port)..."
+      systemctl stop "$sock" 2>/dev/null || true
+      systemctl disable "$sock" 2>/dev/null || true
+      systemctl mask "$sock" 2>/dev/null || true
+    fi
+  done
+  # Drop-in overrides for ListenStream if socket somehow re-enabled later
+  if [[ -f /lib/systemd/system/ssh.socket ]] || [[ -f /usr/lib/systemd/system/ssh.socket ]]; then
+    mkdir -p /etc/systemd/system/ssh.socket.d
+    cat >/etc/systemd/system/ssh.socket.d/override.conf <<EOF
+[Socket]
+ListenStream=
+EOF
+  fi
+}
+
+validate_sshd_config() {
+  if command -v sshd >/dev/null 2>&1; then
+    sshd -t
+    return $?
+  fi
+  # Some builds only have /usr/sbin/sshd
+  if [[ -x /usr/sbin/sshd ]]; then
+    /usr/sbin/sshd -t
+    return $?
+  fi
+  warn "sshd -t недоступен — пропускаю валидацию конфига"
+  return 0
+}
+
+# Hard apply sshd settings without rebooting the whole server
+apply_ssh_now() {
+  local want_port="${1:-}"
   local svc
   svc=$(ssh_service_name)
-  if systemctl is-active --quiet "$svc"; then
-    systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc"
-  else
-    systemctl restart "$svc"
+
+  disable_ssh_socket_activation
+  validate_sshd_config || {
+    err "sshd_config невалиден — SSH не перезапускаю"
+    return 1
+  }
+
+  systemctl daemon-reload 2>/dev/null || true
+
+  # Prefer restart over reload: Port / Auth changes often ignored by SIGHUP/reload
+  log "Жёсткий restart ${svc}.service (не reload)..."
+  systemctl enable "$svc" 2>/dev/null || true
+  systemctl restart "$svc"
+
+  # Give daemon a moment to bind
+  sleep 1
+  local i
+  for i in 1 2 3 4 5; do
+    if [[ -n "$want_port" ]]; then
+      if ssh_listening_on_port "$want_port"; then
+        ok "SSH слушает TCP ${want_port}"
+        return 0
+      fi
+    elif systemctl is-active --quiet "$svc"; then
+      ok "${svc} active"
+      return 0
+    fi
+    sleep 1
+    systemctl restart "$svc" 2>/dev/null || true
+  done
+
+  if [[ -n "$want_port" ]] && ! ssh_listening_on_port "$want_port"; then
+    err "После restart порт ${want_port} всё ещё не слушается"
+    systemctl status "$svc" --no-pager -l 2>/dev/null | tail -20 || true
+    ss -tlnp | grep -E 'ssh|sshd' || true
+    return 1
   fi
+  return 0
+}
+
+# Back-compat name used elsewhere
+reload_ssh() {
+  apply_ssh_now
 }
 
 ensure_ssh_setting() {
@@ -282,20 +371,31 @@ change_ssh_port() {
   SSH_PORT_NEW="$port"
 
   ensure_ssh_setting Port "$SSH_PORT_NEW"
-  open_firewall_port "$SSH_PORT_NEW"
-
-  if ! sshd -t 2>/dev/null && ! sshd -t -f /etc/ssh/sshd_config 2>/dev/null; then
-    # Some distros use `sshd -t`, validate via service name binary
-    if command -v sshd >/dev/null 2>&1; then
-      sshd -t || {
-        err "sshd_config невалиден"
-        return 1
-      }
+  # Also force Port in main file if Include is missing / ignored
+  if [[ -f /etc/ssh/sshd_config ]] && ! grep -Eq '^\s*Include\s+.*/sshd_config\.d/' /etc/ssh/sshd_config; then
+    if grep -Eq '^[#[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config; then
+      sed -i -E "s/^[#[:space:]]*Port[[:space:]].*/Port ${SSH_PORT_NEW}/I" /etc/ssh/sshd_config
+    else
+      printf '\nPort %s\n' "$SSH_PORT_NEW" >>/etc/ssh/sshd_config
     fi
   fi
 
-  reload_ssh
-  ok "SSH слушает порт ${SSH_PORT_NEW} (старый 22 не закрывался)"
+  open_firewall_port "$SSH_PORT_NEW"
+
+  if ! apply_ssh_now "$SSH_PORT_NEW"; then
+    err "Порт в конфиге записан (${SSH_PORT_NEW}), но сервис не слушает его"
+    return 1
+  fi
+
+  # Effective port from running daemon
+  local effective
+  effective=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)
+  if [[ -n "$effective" && "$effective" != "$SSH_PORT_NEW" ]]; then
+    err "sshd -T показывает port=${effective}, ожидали ${SSH_PORT_NEW}"
+    return 1
+  fi
+
+  ok "SSH порт применён без reboot: ${SSH_PORT_NEW} (старый 22 не закрывался фаерволом)"
   warn "Проверьте вход на новом порту во второй сессии, прежде чем закрывать текущую."
 
   if [[ "$RAN_ALL" -eq 0 ]]; then
@@ -336,10 +436,10 @@ disable_password_auth() {
   # Pubkey must stay on
   ensure_ssh_setting PubkeyAuthentication yes
 
-  if command -v sshd >/dev/null 2>&1; then
-    sshd -t
+  if command -v sshd >/dev/null 2>&1 || [[ -x /usr/sbin/sshd ]]; then
+    validate_sshd_config || return 1
   fi
-  reload_ssh
+  apply_ssh_now "${SSH_PORT_NEW:-}" || apply_ssh_now
   ok "PasswordAuthentication=no, PermitRootLogin=no (root SSH запрещён)"
 }
 
