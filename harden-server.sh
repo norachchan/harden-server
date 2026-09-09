@@ -222,7 +222,7 @@ cleanup_ssh_socket_unit() {
 }
 
 # Explicit socket listen (belt-and-suspenders alongside Port in sshd_config).
-# Empty ListenStream= clears package defaults; then set the new port.
+# Empty ListenStream= clears package defaults; BindIPv6Only avoids EADDRINUSE on [::].
 write_ssh_socket_listen() {
   local port="$1"
   [[ -n "$port" ]] || return 0
@@ -235,15 +235,94 @@ write_ssh_socket_listen() {
 ListenStream=
 ListenStream=0.0.0.0:${port}
 ListenStream=[::]:${port}
+BindIPv6Only=ipv6-only
 EOF
 }
 
+clear_ssh_socket_listen() {
+  rm -f /etc/systemd/system/ssh.socket.d/listen.conf
+  rmdir /etc/systemd/system/ssh.socket.d 2>/dev/null || true
+}
+
 has_ssh_socket_unit() {
-  systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.socket' \
-    || [[ -f /lib/systemd/system/ssh.socket || -f /usr/lib/systemd/system/ssh.socket ]]
+  [[ -f /lib/systemd/system/ssh.socket || -f /usr/lib/systemd/system/ssh.socket ]] \
+    || systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.socket'
+}
+
+# Use socket activation when it's actually the listener path (Ubuntu 24.04+ / some Debian).
+# If only ssh.service is running classically, prefer service restart.
+prefer_ssh_socket_activation() {
+  has_ssh_socket_unit || return 1
+  # Generator present → Ubuntu-style (Port in sshd_config drives socket)
+  if [[ -x /usr/lib/systemd/system-generators/sshd-socket-generator ]] \
+    || [[ -x /lib/systemd/system-generators/sshd-socket-generator ]]; then
+    return 0
+  fi
+  # Socket already enabled or active
+  if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
+    return 0
+  fi
+  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
+restart_ssh_via_service() {
+  local svc="$1" want_port="${2:-}"
+  log "Restart ${svc}.service (без socket activation)..."
+  clear_ssh_socket_listen
+  systemctl disable --now ssh.socket 2>/dev/null || true
+  systemctl disable --now sshd.socket 2>/dev/null || true
+  systemctl reset-failed ssh.socket 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable "$svc" 2>/dev/null || true
+  systemctl restart "$svc" || {
+    err "Не удалось restart ${svc}.service"
+    systemctl status "$svc" --no-pager -l 2>/dev/null | tail -25 || true
+    return 1
+  }
+  return 0
+}
+
+restart_ssh_via_socket() {
+  local svc="$1" want_port="$2"
+  log "Restart ssh.socket (socket activation)..."
+  if [[ -n "$want_port" ]]; then
+    write_ssh_socket_listen "$want_port"
+  fi
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable ssh.socket 2>/dev/null || true
+  # Free binds: stop standalone sshd if it holds ports (KillMode=process keeps sessions)
+  systemctl stop "$svc" 2>/dev/null || true
+  systemctl reset-failed ssh.socket 2>/dev/null || true
+  if ! systemctl restart ssh.socket; then
+    warn "ssh.socket restart не удался — пробую IPv4-only ListenStream"
+    if [[ -n "$want_port" ]]; then
+      mkdir -p /etc/systemd/system/ssh.socket.d
+      cat >/etc/systemd/system/ssh.socket.d/listen.conf <<EOF
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:${want_port}
+EOF
+      systemctl daemon-reload 2>/dev/null || true
+      systemctl reset-failed ssh.socket 2>/dev/null || true
+      if systemctl restart ssh.socket; then
+        return 0
+      fi
+    fi
+    systemctl status ssh.socket --no-pager -l 2>/dev/null | tail -25 || true
+    return 1
+  fi
+  return 0
 }
 
 validate_sshd_config() {
+  # sshd -t needs privilege separation dir; after reboot/tmpfs wipe it may be missing
+  # until ssh.service creates RuntimeDirectory=sshd
+  mkdir -p /run/sshd
+  chmod 755 /run/sshd
+
   if command -v sshd >/dev/null 2>&1; then
     sshd -t
     return $?
@@ -260,7 +339,7 @@ validate_sshd_config() {
 # Hard apply sshd settings without rebooting the whole server
 apply_ssh_now() {
   local want_port="${1:-}"
-  local svc
+  local svc use_socket=0
   svc=$(ssh_service_name)
 
   cleanup_ssh_socket_unit
@@ -269,34 +348,21 @@ apply_ssh_now() {
     return 1
   }
 
-  if [[ -n "$want_port" ]] && has_ssh_socket_unit; then
-    write_ssh_socket_listen "$want_port"
+  if prefer_ssh_socket_activation; then
+    use_socket=1
   fi
 
-  systemctl daemon-reload 2>/dev/null || true
-
-  if has_ssh_socket_unit; then
-    # Ubuntu 24.04: listening port owned by ssh.socket (generator reads Port from sshd_config)
-    log "Restart ssh.socket (Ubuntu socket activation)..."
-    systemctl enable ssh.socket 2>/dev/null || true
-    if ! systemctl restart ssh.socket; then
-      err "Не удалось restart ssh.socket"
-      systemctl status ssh.socket --no-pager -l 2>/dev/null | tail -25 || true
-      return 1
+  if [[ "$use_socket" -eq 1 ]]; then
+    if ! restart_ssh_via_socket "$svc" "$want_port"; then
+      warn "Откат на классический ${svc}.service..."
+      restart_ssh_via_service "$svc" "$want_port" || return 1
+      use_socket=0
     fi
-    # Re-attach/restart daemon that may still hold the old port
-    systemctl try-restart "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
   else
-    log "Жёсткий restart ${svc}.service (не reload)..."
-    systemctl enable "$svc" 2>/dev/null || true
-    systemctl restart "$svc" || {
-      err "Не удалось restart ${svc}.service"
-      systemctl status "$svc" --no-pager -l 2>/dev/null | tail -25 || true
-      return 1
-    }
+    restart_ssh_via_service "$svc" "$want_port" || return 1
   fi
 
-  # Give daemon a moment to bind
+  # Give daemon/socket a moment to bind
   sleep 1
   local i
   for i in 1 2 3 4 5; do
@@ -310,13 +376,23 @@ apply_ssh_now() {
       return 0
     fi
     sleep 1
-    if has_ssh_socket_unit; then
+    if [[ "$use_socket" -eq 1 ]]; then
       systemctl restart ssh.socket 2>/dev/null || true
-      systemctl try-restart "$svc" 2>/dev/null || true
     else
       systemctl restart "$svc" 2>/dev/null || true
     fi
   done
+
+  # Last resort: classic service if socket path didn't bind the port
+  if [[ -n "$want_port" && "$use_socket" -eq 1 ]] && ! ssh_listening_on_port "$want_port"; then
+    warn "Порт не слушается через socket — финальный откат на ${svc}.service"
+    restart_ssh_via_service "$svc" "$want_port" || true
+    sleep 1
+    if ssh_listening_on_port "$want_port"; then
+      ok "SSH слушает TCP ${want_port} (через ${svc}.service)"
+      return 0
+    fi
+  fi
 
   if [[ -n "$want_port" ]] && ! ssh_listening_on_port "$want_port"; then
     err "После restart порт ${want_port} всё ещё не слушается"
