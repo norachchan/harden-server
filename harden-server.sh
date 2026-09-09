@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.09-4"
+SCRIPT_VERSION="2026.09.09-5"
 
 # ---------------------------------------------------------------------------
 # UI
@@ -438,9 +438,67 @@ ensure_ssh_setting() {
   fi
 }
 
+# Discover nftables chains with "hook input" and insert accept for TCP port.
+nft_open_tcp_port() {
+  local port="$1" opened=0
+  local fam table chain ruleset
+
+  command -v nft >/dev/null 2>&1 || return 1
+  ruleset=$(nft list ruleset 2>/dev/null) || return 1
+  [[ -n "$ruleset" ]] || return 1
+
+  while IFS= read -r fam table chain; do
+    [[ -n "$fam" && -n "$table" && -n "$chain" ]] || continue
+    if nft list chain "$fam" "$table" "$chain" 2>/dev/null \
+      | grep -Eq "tcp dport (= )?${port}[[:space:]].*accept|dport ${port}[[:space:]].*accept"; then
+      ok "nftables: TCP ${port} уже accept (${fam} ${table} ${chain})"
+      opened=1
+      continue
+    fi
+    if nft insert rule "$fam" "$table" "$chain" tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null \
+      || nft insert rule "$fam" "$table" "$chain" meta l4proto tcp tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null; then
+      ok "nftables: accept TCP ${port} → ${fam} ${table} ${chain}"
+      opened=1
+    fi
+  done < <(
+    printf '%s\n' "$ruleset" | awk '
+      BEGIN { fam=""; table=""; chain=""; input=0 }
+      /^table / {
+        fam=$2; table=$3; gsub(/[{]/,"",table); chain=""; input=0; next
+      }
+      /^[[:space:]]*chain[[:space:]]+/ {
+        chain=$2; gsub(/[{]/,"",chain); input=0; next
+      }
+      chain != "" && /hook[[:space:]]+input/ { input=1 }
+      chain != "" && input == 1 && /^[[:space:]]*\}/ {
+        print fam, table, chain
+        chain=""; input=0
+        next
+      }
+      chain != "" && /^[[:space:]]*\}/ {
+        chain=""; input=0; next
+      }
+    '
+  )
+
+  if [[ "$opened" -eq 0 ]]; then
+    local line
+    for line in "inet filter input" "inet filter INPUT" "ip filter INPUT" "ip filter input" "ip6 filter INPUT"; do
+      # shellcheck disable=SC2086
+      set -- $line
+      nft list chain "$1" "$2" "$3" >/dev/null 2>&1 || continue
+      if nft insert rule "$1" "$2" "$3" tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null; then
+        ok "nftables: accept TCP ${port} → $line"
+        opened=1
+      fi
+    done
+  fi
+
+  [[ "$opened" -eq 1 ]]
+}
+
 open_firewall_port() {
   local port="$1" opened=0
-  local fam table chain line
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
     ufw allow "${port}/tcp" comment 'harden-ssh' >/dev/null || true
@@ -455,7 +513,7 @@ open_firewall_port() {
     opened=1
   fi
 
-  # iptables / iptables-nft — всегда пробуем (раньше nft-ветка делала return и блокировала это)
+  # iptables может отсутствовать (чистый nft) — не ошибка
   if command -v iptables >/dev/null 2>&1; then
     if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
       ok "iptables: TCP ${port} уже разрешён"
@@ -476,34 +534,19 @@ open_firewall_port() {
     fi
   fi
 
-  # Прямой nft insert в известные input-цепочки
-  if command -v nft >/dev/null 2>&1; then
-    for line in \
-      "inet filter input" \
-      "inet filter INPUT" \
-      "ip filter INPUT" \
-      "ip filter input" \
-      "ip6 filter INPUT" \
-      "ip6 filter input"
-    do
-      # shellcheck disable=SC2086
-      set -- $line
-      fam=$1; table=$2; chain=$3
-      nft list chain "$fam" "$table" "$chain" >/dev/null 2>&1 || continue
-      if nft list chain "$fam" "$table" "$chain" 2>/dev/null | grep -Eq "tcp dport (= )?${port} .*accept|dport ${port} accept"; then
-        ok "nftables: TCP ${port} уже в ${fam} ${table} ${chain}"
-        opened=1
-        continue
-      fi
-      if nft insert rule "$fam" "$table" "$chain" tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null; then
-        ok "nftables: accept TCP ${port} → ${fam} ${table} ${chain}"
-        opened=1
-      fi
-    done
+  if nft_open_tcp_port "$port"; then
+    opened=1
+  fi
+
+  # Persist nft if debian nftables service /ruleset file exists
+  if [[ "$opened" -eq 1 && -f /etc/nftables.conf ]] && command -v nft >/dev/null 2>&1; then
+    # Do not overwrite whole conf; best-effort dump optional — skip to avoid breaking vendor policy
+    :
   fi
 
   if [[ "$opened" -eq 0 ]]; then
-    warn "Локальный firewall: правило для TCP ${port} не добавлено автоматически."
+    warn "Локальный firewall: правило для TCP ${port} не добавлено."
+    warn "Покажите структуру: nft list ruleset | head -80"
   fi
   warn "Если порт снаружи недоступен — откройте TCP ${port} в панели хостинга / Security Group."
 }
