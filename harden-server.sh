@@ -563,7 +563,7 @@ reset_xui_credentials() {
   }
 
   XUI_USER=$(gen_alnum 12)
-  XUI_PASS=$(gen_alnum 24)
+  XUI_PASS=$(gen_alnum 60)
 
   # Менять БД при работающей панели опасно (sqlite WAL) — сначала stop
   log "Останавливаю x-ui перед сменой credentials..."
