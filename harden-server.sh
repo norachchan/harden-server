@@ -4,6 +4,8 @@
 
 set -euo pipefail
 
+SCRIPT_VERSION="2026.09.09-3"
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -249,45 +251,52 @@ has_ssh_socket_unit() {
     || systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.socket'
 }
 
-# Use socket activation when it's actually the listener path (Ubuntu 24.04+ / some Debian).
-# If only ssh.service is running classically, prefer service restart.
+# Socket activation ONLY when sshd-socket-generator exists (Ubuntu 22.10/24.04+).
+# On Debian 11 ssh.socket may be enabled but dual ListenStream breaks with EADDRINUSE —
+# always use classic ssh.service there.
 prefer_ssh_socket_activation() {
-  has_ssh_socket_unit || return 1
-  # Generator present → Ubuntu-style (Port in sshd_config drives socket)
-  if [[ -x /usr/lib/systemd/system-generators/sshd-socket-generator ]] \
-    || [[ -x /lib/systemd/system-generators/sshd-socket-generator ]]; then
-    return 0
-  fi
-  # Socket already enabled or active
-  if systemctl is-enabled --quiet ssh.socket 2>/dev/null; then
-    return 0
-  fi
-  if systemctl is-active --quiet ssh.socket 2>/dev/null; then
-    return 0
-  fi
-  return 1
+  [[ -x /usr/lib/systemd/system-generators/sshd-socket-generator ]] \
+    || [[ -x /lib/systemd/system-generators/sshd-socket-generator ]]
 }
 
 restart_ssh_via_service() {
   local svc="$1" want_port="${2:-}"
-  log "Restart ${svc}.service (без socket activation)..."
+  log "Restart ${svc}.service (классический режим, без ssh.socket)..."
   clear_ssh_socket_listen
-  systemctl disable --now ssh.socket 2>/dev/null || true
-  systemctl disable --now sshd.socket 2>/dev/null || true
+  # Stop socket so it cannot hold/conflict with Port from sshd_config
+  systemctl stop ssh.socket 2>/dev/null || true
+  systemctl stop sshd.socket 2>/dev/null || true
+  systemctl disable ssh.socket 2>/dev/null || true
+  systemctl disable sshd.socket 2>/dev/null || true
   systemctl reset-failed ssh.socket 2>/dev/null || true
+  # Mask prevents socket from coming back via sockets.target / RequiredBy
+  systemctl mask ssh.socket 2>/dev/null || true
+  systemctl mask sshd.socket 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
+  mkdir -p /run/sshd
+  chmod 755 /run/sshd
   systemctl enable "$svc" 2>/dev/null || true
-  systemctl restart "$svc" || {
-    err "Не удалось restart ${svc}.service"
-    systemctl status "$svc" --no-pager -l 2>/dev/null | tail -25 || true
-    return 1
-  }
+  if ! systemctl restart "$svc"; then
+    # Some images tie ssh.service to ssh.socket — unmask and retry
+    warn "restart ${svc} не удался после mask socket — пробую без mask"
+    systemctl unmask ssh.socket 2>/dev/null || true
+    systemctl unmask sshd.socket 2>/dev/null || true
+    systemctl disable --now ssh.socket 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart "$svc" || {
+      err "Не удалось restart ${svc}.service"
+      systemctl status "$svc" --no-pager -l 2>/dev/null | tail -25 || true
+      return 1
+    }
+  fi
   return 0
 }
 
 restart_ssh_via_socket() {
   local svc="$1" want_port="$2"
-  log "Restart ssh.socket (socket activation)..."
+  log "Restart ssh.socket (Ubuntu generator / socket activation)..."
+  systemctl unmask ssh.socket 2>/dev/null || true
+  systemctl unmask sshd.socket 2>/dev/null || true
   if [[ -n "$want_port" ]]; then
     write_ssh_socket_listen "$want_port"
   fi
@@ -801,7 +810,7 @@ show_menu() {
 ╚────────────────────────────────────────────────╝
 EOF
   echo -e "${NC}"
-  echo -e "OS: ${os_pretty}"
+  echo -e "OS: ${os_pretty}  |  script: ${SCRIPT_VERSION}"
   echo -e "${YELLOW}Секреты показываются один раз и никуда не сохраняются.${NC}"
   echo
 }
