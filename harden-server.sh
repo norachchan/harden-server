@@ -80,7 +80,7 @@ detect_os_user() {
   fi
 }
 
-# 60-char password: upper/lower/digit/special (similar to the given sample style)
+# OS passwords: long, with specials (for root / system user via chpasswd)
 gen_password_60() {
   local alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{};:,.<>/?'
   local pass="" i idx
@@ -103,9 +103,19 @@ gen_password_60() {
   printf '%s' "$pass"
 }
 
+# Panel credentials: alphanumeric only (как в официальном 3x-ui) — спецсимволы
+# в веб-форме часто ломают логин / копипаст.
+gen_alnum() {
+  local length="${1:-16}"
+  if command -v openssl >/dev/null 2>&1; then
+    openssl rand -base64 $((length * 2)) | tr -dc 'a-zA-Z0-9' | head -c "$length"
+  else
+    tr -dc 'a-zA-Z0-9' </dev/urandom | head -c "$length"
+  fi
+}
+
 gen_username() {
-  local n=$((16 + RANDOM % 9)) # 16..24
-  tr -dc 'a-z' </dev/urandom | head -c "$n"
+  gen_alnum 12
 }
 
 port_in_use() {
@@ -535,37 +545,59 @@ restart_xui_panel() {
   return 1
 }
 
+stop_xui_panel() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
+    systemctl stop x-ui || true
+    sleep 1
+    return 0
+  fi
+  return 1
+}
+
 reset_xui_credentials() {
   log "Сброс логина/пароля 3x-ui..."
-  local bin
+  local bin out shown got_user
   bin=$(find_xui_binary) || {
     err "Бинарник /usr/local/x-ui/x-ui не найден — пункт пропущен"
     return 0
   }
 
-  XUI_USER=$(gen_username)
-  while :; do
-    XUI_PASS=$(gen_password_60)
-    [[ "$XUI_PASS" != "${ROOT_PASS:-}" && "$XUI_PASS" != "${SYS_PASS:-}" ]] && break
-  done
+  XUI_USER=$(gen_alnum 12)
+  XUI_PASS=$(gen_alnum 24)
 
-  # Direct CLI (same as x-ui.sh reset_user) — no fragile expect/menu
-  if ! "$bin" setting -username "$XUI_USER" -password "$XUI_PASS" -resetTwoFactor=true >/dev/null 2>&1; then
-    err "Не удалось выполнить: $bin setting -username ... -password ..."
+  # Менять БД при работающей панели опасно (sqlite WAL) — сначала stop
+  log "Останавливаю x-ui перед сменой credentials..."
+  stop_xui_panel || warn "Не удалось остановить x-ui — пробую сменить credentials на горячую"
+
+  # Direct CLI (как x-ui.sh reset_user) + сброс 2FA
+  out=$("$bin" setting -username "$XUI_USER" -password "$XUI_PASS" -resetTwoFactor=true 2>&1) || {
+    err "Не удалось выполнить setting: $out"
     XUI_USER=""; XUI_PASS=""
+    restart_xui_panel || true
+    return 1
+  }
+
+  # Проверка, что username реально записался
+  shown=$("$bin" setting -show 2>&1 || true)
+  got_user=$(printf '%s\n' "$shown" | grep -iE 'username' | head -1 | awk -F'[=: ]+' '{print $NF}' | tr -d '[:space:]' || true)
+  if [[ -n "$got_user" && "$got_user" != "$XUI_USER" ]]; then
+    err "В БД username=${got_user}, ожидали ${XUI_USER} — credentials могли не сохраниться"
+    XUI_USER=""; XUI_PASS=""
+    restart_xui_panel || true
     return 1
   fi
 
   restart_xui_panel || true
   sleep 1
   read_xui_url_hint
-  ok "Учётные данные панели 3x-ui сброшены"
+  ok "Учётные данные панели 3x-ui сброшены (2FA сброшен)"
 
   if [[ "$RAN_ALL" -eq 0 ]]; then
     print_secret_once_banner
     echo -e "${BOLD}3x-ui username:${NC} ${XUI_USER}"
     echo -e "${BOLD}3x-ui password:${NC} ${XUI_PASS}"
     [[ -n "$XUI_URL" ]] && echo -e "${BOLD}3x-ui URL:${NC}      ${XUI_URL}"
+    echo -e "${YELLOW}Логин/пароль только a-zA-Z0-9 — копируйте целиком, без пробелов.${NC}"
     echo
   fi
 }
