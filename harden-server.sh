@@ -62,6 +62,7 @@ SSH_PORT_NEW=""
 XUI_USER=""
 XUI_PASS=""
 XUI_URL=""
+XUI_API_TOKEN=""
 RAN_ALL=0
 
 # ---------------------------------------------------------------------------
@@ -554,6 +555,20 @@ stop_xui_panel() {
   return 1
 }
 
+read_xui_api_token() {
+  # Existing panel UI tokens are hashed — CLI regenerates a fallback token and prints it once.
+  XUI_API_TOKEN=""
+  local bin raw
+  bin=$(find_xui_binary 2>/dev/null || true)
+  [[ -n "$bin" ]] || return 1
+  raw=$("$bin" setting -getApiToken 2>&1 || true)
+  XUI_API_TOKEN=$(printf '%s\n' "$raw" | awk -F': ' '/^apiToken:/{print $2; exit}' | tr -d '[:space:]')
+  if [[ -z "$XUI_API_TOKEN" ]]; then
+    XUI_API_TOKEN=$(printf '%s\n' "$raw" | grep -oE 'apiToken:[[:space:]]*[^[:space:]]+' | awk '{print $2; exit}' || true)
+  fi
+  [[ -n "$XUI_API_TOKEN" ]]
+}
+
 reset_xui_credentials() {
   log "Сброс логина/пароля 3x-ui..."
   local bin out shown got_user
@@ -564,6 +579,7 @@ reset_xui_credentials() {
 
   XUI_USER=$(gen_alnum 12)
   XUI_PASS=$(gen_alnum 60)
+  XUI_API_TOKEN=""
 
   # Менять БД при работающей панели опасно (sqlite WAL) — сначала stop
   log "Останавливаю x-ui перед сменой credentials..."
@@ -572,7 +588,7 @@ reset_xui_credentials() {
   # Direct CLI (как x-ui.sh reset_user) + сброс 2FA
   out=$("$bin" setting -username "$XUI_USER" -password "$XUI_PASS" -resetTwoFactor=true 2>&1) || {
     err "Не удалось выполнить setting: $out"
-    XUI_USER=""; XUI_PASS=""
+    XUI_USER=""; XUI_PASS=""; XUI_API_TOKEN=""
     restart_xui_panel || true
     return 1
   }
@@ -582,9 +598,16 @@ reset_xui_credentials() {
   got_user=$(printf '%s\n' "$shown" | grep -iE 'username' | head -1 | awk -F'[=: ]+' '{print $NF}' | tr -d '[:space:]' || true)
   if [[ -n "$got_user" && "$got_user" != "$XUI_USER" ]]; then
     err "В БД username=${got_user}, ожидали ${XUI_USER} — credentials могли не сохраниться"
-    XUI_USER=""; XUI_PASS=""
+    XUI_USER=""; XUI_PASS=""; XUI_API_TOKEN=""
     restart_xui_panel || true
     return 1
+  fi
+
+  # API token: старые UI-токены в plaintext недоступны — CLI выдаёт новый fallback
+  if read_xui_api_token; then
+    ok "API token получен (предыдущий CLI fallback больше недействителен)"
+  else
+    warn "Не удалось получить API token через setting -getApiToken"
   fi
 
   restart_xui_panel || true
@@ -594,9 +617,10 @@ reset_xui_credentials() {
 
   if [[ "$RAN_ALL" -eq 0 ]]; then
     print_secret_once_banner
-    echo -e "${BOLD}3x-ui username:${NC} ${XUI_USER}"
-    echo -e "${BOLD}3x-ui password:${NC} ${XUI_PASS}"
-    [[ -n "$XUI_URL" ]] && echo -e "${BOLD}3x-ui URL:${NC}      ${XUI_URL}"
+    echo -e "${BOLD}3x-ui username:${NC}  ${XUI_USER}"
+    echo -e "${BOLD}3x-ui password:${NC}  ${XUI_PASS}"
+    [[ -n "$XUI_API_TOKEN" ]] && echo -e "${BOLD}3x-ui api key:${NC}   ${XUI_API_TOKEN}"
+    [[ -n "$XUI_URL" ]] && echo -e "${BOLD}3x-ui URL:${NC}       ${XUI_URL}"
     echo -e "${YELLOW}Логин/пароль только a-zA-Z0-9 — копируйте целиком, без пробелов.${NC}"
     echo
   fi
@@ -622,6 +646,7 @@ print_summary_once() {
   echo -e "PasswordAuth:      $(password_auth_status)"
   [[ -n "$XUI_USER" ]] && echo -e "3x-ui username:    ${XUI_USER}"
   [[ -n "$XUI_PASS" ]] && echo -e "3x-ui password:    ${XUI_PASS}"
+  [[ -n "$XUI_API_TOKEN" ]] && echo -e "3x-ui api key:     ${XUI_API_TOKEN}"
   [[ -n "$XUI_URL" ]] && echo -e "3x-ui URL:         ${XUI_URL}"
   echo -e "${BOLD}====================================${NC}"
   echo
@@ -643,7 +668,7 @@ run_all() {
   reset_xui_credentials || true
   print_summary_once
   # Prevent accidental reprint if user continues in menu
-  ROOT_PASS=""; SYS_PASS=""; XUI_PASS=""
+  ROOT_PASS=""; SYS_PASS=""; XUI_PASS=""; XUI_API_TOKEN=""
   RAN_ALL=0
 }
 
@@ -691,7 +716,7 @@ main() {
       3) create_system_user; SYS_PASS=""; pause ;;
       4) change_ssh_port; pause ;;
       5) disable_password_auth; pause ;;
-      6) reset_xui_credentials; XUI_PASS=""; pause ;;
+      6) reset_xui_credentials; XUI_PASS=""; XUI_API_TOKEN=""; pause ;;
       *) err "Неверный выбор"; sleep 1 ;;
     esac
   done
