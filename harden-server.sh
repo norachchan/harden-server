@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.09-7"
+SCRIPT_VERSION="2026.09.09-8"
 
 # ---------------------------------------------------------------------------
 # UI
@@ -223,8 +223,7 @@ cleanup_ssh_socket_unit() {
   systemctl unmask sshd.socket 2>/dev/null || true
 }
 
-# Explicit socket listen (belt-and-suspenders alongside Port in sshd_config).
-# Empty ListenStream= clears package defaults; BindIPv6Only avoids EADDRINUSE on [::].
+# Explicit socket listen. Keep :22 as fallback — many host panels only allow 22.
 write_ssh_socket_listen() {
   local port="$1"
   [[ -n "$port" ]] || return 0
@@ -232,13 +231,25 @@ write_ssh_socket_listen() {
     return 0
   fi
   mkdir -p /etc/systemd/system/ssh.socket.d
-  cat >/etc/systemd/system/ssh.socket.d/listen.conf <<EOF
+  if [[ "$port" != "22" ]]; then
+    cat >/etc/systemd/system/ssh.socket.d/listen.conf <<EOF
 [Socket]
 ListenStream=
 ListenStream=0.0.0.0:${port}
 ListenStream=[::]:${port}
+ListenStream=0.0.0.0:22
+ListenStream=[::]:22
 BindIPv6Only=ipv6-only
 EOF
+  else
+    cat >/etc/systemd/system/ssh.socket.d/listen.conf <<EOF
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:22
+ListenStream=[::]:22
+BindIPv6Only=ipv6-only
+EOF
+  fi
 }
 
 clear_ssh_socket_listen() {
@@ -648,6 +659,30 @@ create_system_user() {
   fi
 }
 
+# Write dual Port lines (new + 22). OpenSSH allows multiple Port directives.
+set_ssh_ports_dual() {
+  local new_port="$1"
+  local drop="/etc/ssh/sshd_config.d/99-harden.conf"
+  local main="/etc/ssh/sshd_config"
+  mkdir -p /etc/ssh/sshd_config.d
+  touch "$drop"
+
+  # Remove existing Port lines from drop-in, then write both
+  if grep -Eq '^[[:space:]]*Port[[:space:]]+' "$drop"; then
+    sed -i -E '/^[[:space:]]*Port[[:space:]]+/Id' "$drop"
+  fi
+  {
+    echo "Port ${new_port}"
+    echo "Port 22"
+  } >>"$drop"
+
+  # Comment Port in main if present (drop-in Include usually wins by first-match —
+  # neutralize main Port to avoid surprises)
+  if [[ -f "$main" ]]; then
+    sed -i -E 's/^[[:space:]]*Port[[:space:]].*/#&/I' "$main" || true
+  fi
+}
+
 change_ssh_port() {
   log "Смена SSH-порта..."
   local port f
@@ -668,17 +703,11 @@ change_ssh_port() {
     done
   fi
 
-  ensure_ssh_setting Port "$SSH_PORT_NEW"
-  # Also force Port in main file if Include is missing / ignored
-  if [[ -f /etc/ssh/sshd_config ]] && ! grep -Eq '^\s*Include\s+.*/sshd_config\.d/' /etc/ssh/sshd_config; then
-    if grep -Eq '^[#[:space:]]*Port[[:space:]]+' /etc/ssh/sshd_config; then
-      sed -i -E "s/^[#[:space:]]*Port[[:space:]].*/Port ${SSH_PORT_NEW}/I" /etc/ssh/sshd_config
-    else
-      printf '\nPort %s\n' "$SSH_PORT_NEW" >>/etc/ssh/sshd_config
-    fi
-  fi
+  # Слушаем НОВЫЙ порт + 22 (хостинг часто режет всё кроме 22 снаружи)
+  set_ssh_ports_dual "$SSH_PORT_NEW"
 
   open_firewall_port "$SSH_PORT_NEW"
+  open_firewall_port 22
 
   if ! apply_ssh_now "$SSH_PORT_NEW"; then
     err "Порт в конфиге записан (${SSH_PORT_NEW}), но сервис не слушает его"
@@ -686,18 +715,21 @@ change_ssh_port() {
     return 1
   fi
 
-  local effective
-  effective=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)
-  if [[ -n "$effective" && "$effective" != "$SSH_PORT_NEW" ]]; then
-    warn "sshd -T показывает port=${effective}; слушающий порт проверен через ss"
+  if ssh_listening_on_port 22; then
+    ok "SSH также слушает TCP 22 (запасной вход, пока не откроете новый порт в панели хостинга)"
+  else
+    warn "TCP 22 не слушается — снаружи может не быть запасного входа"
   fi
 
-  ok "SSH порт применён без reboot: ${SSH_PORT_NEW} (старый 22 не закрывался фаерволом)"
-  warn "Проверьте вход на новом порту во второй сессии, прежде чем закрывать текущую."
+  ok "SSH порты: ${SSH_PORT_NEW} + 22"
+  warn "Снаружи новый порт часто закрыт панелью хостинга. Пока заходите так:"
+  warn "  ssh -p ${SSH_PORT_NEW} debian@IP   # если порт открыт в панели"
+  warn "  ssh -p 22 debian@IP                # запасной (ключ, не root/password)"
+  warn "После проверки нового порта закройте 22 вручную в sshd + панели."
 
   if [[ "$RAN_ALL" -eq 0 ]]; then
     print_secret_once_banner
-    echo -e "${BOLD}SSH port:${NC} ${SSH_PORT_NEW}"
+    echo -e "${BOLD}SSH ports:${NC} ${SSH_PORT_NEW} (новый) + 22 (запасной)"
     echo
   fi
 }
@@ -925,7 +957,7 @@ print_summary_once() {
   [[ -n "$ROOT_PASS" ]] && echo -e "root password:     ${ROOT_PASS}"
   [[ -n "$SYS_USER" ]] && echo -e "system user:       ${SYS_USER}"
   [[ -n "$SYS_PASS" ]] && echo -e "system password:   ${SYS_PASS}"
-  [[ -n "$SSH_PORT_NEW" ]] && echo -e "SSH port:          ${SSH_PORT_NEW}"
+  [[ -n "$SSH_PORT_NEW" ]] && echo -e "SSH ports:         ${SSH_PORT_NEW} + 22 (fallback)"
   echo -e "PasswordAuth:      $(password_auth_status)"
   [[ -n "$XUI_USER" ]] && echo -e "3x-ui username:    ${XUI_USER}"
   [[ -n "$XUI_PASS" ]] && echo -e "3x-ui password:    ${XUI_PASS}"
