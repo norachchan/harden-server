@@ -62,7 +62,6 @@ SSH_PORT_NEW=""
 XUI_USER=""
 XUI_PASS=""
 XUI_URL=""
-XUI_API_TOKEN=""
 RAN_ALL=0
 
 # ---------------------------------------------------------------------------
@@ -107,14 +106,12 @@ gen_password_60() {
 # Panel credentials: alphanumeric only (как в официальном 3x-ui) — спецсимволы
 # в веб-форме часто ломают логин / копипаст.
 gen_alnum() {
-  local length="${1:-16}" out
+  local length="${1:-16}"
   if command -v openssl >/dev/null 2>&1; then
-    # Avoid SIGPIPE+pipefail from head closing early
-    out=$(openssl rand -base64 $((length * 3)) | tr -dc 'a-zA-Z0-9' || true)
+    openssl rand -base64 $((length * 2)) | tr -dc 'a-zA-Z0-9' | head -c "$length"
   else
-    out=$(tr -dc 'a-zA-Z0-9' </dev/urandom || true)
+    tr -dc 'a-zA-Z0-9' </dev/urandom | head -c "$length"
   fi
-  printf '%s' "${out:0:length}"
 }
 
 gen_username() {
@@ -557,88 +554,6 @@ stop_xui_panel() {
   return 1
 }
 
-xui_db_path() {
-  if [[ -f /etc/x-ui/x-ui.db ]]; then
-    echo /etc/x-ui/x-ui.db
-  elif [[ -f /etc/x-ui/x-ui.db.db ]]; then
-    echo /etc/x-ui/x-ui.db.db
-  else
-    return 1
-  fi
-}
-
-parse_xui_api_token_from_text() {
-  local raw="$1" line
-  # Avoid sed|head pipelines (SIGPIPE + set -o pipefail → ложный fail)
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    if [[ "$line" =~ [Aa][Pp][Ii][Tt]oken[[:space:]]*[:=][[:space:]]*([A-Za-z0-9_-]+) ]]; then
-      printf '%s' "${BASH_REMATCH[1]}"
-      return 0
-    fi
-  done <<< "$raw"
-  return 1
-}
-
-# Prefer CLI -getApiToken; if empty/unsupported — create SHA-256 token in DB ourselves.
-ensure_xui_api_token() {
-  local bin="${1:-}"
-  local raw="" db="" tok="" hash="" now
-  XUI_API_TOKEN=""
-
-  if [[ -z "$bin" ]]; then
-    bin=$(find_xui_binary 2>/dev/null || true)
-  fi
-
-  if [[ -n "$bin" ]]; then
-    raw=$("$bin" setting -getApiToken 2>&1 || true)
-    XUI_API_TOKEN=$(parse_xui_api_token_from_text "$raw" || true)
-    if [[ -n "$XUI_API_TOKEN" ]]; then
-      ok "API key получен через setting -getApiToken"
-      return 0
-    fi
-  fi
-
-  # Fallback: write our own admin token (plaintext once, hash in DB) — works on older panels too
-  db=$(xui_db_path) || {
-    warn "getApiToken не вернул ключ и БД x-ui не найдена"
-    [[ -n "$raw" ]] && printf '%s\n' "$raw" | tail -n 8 >&2
-    return 1
-  }
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    if command -v apt-get >/dev/null 2>&1; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sqlite3 >/dev/null 2>&1 || true
-    fi
-  fi
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    warn "sqlite3 не установлен — не могу создать API token вручную"
-    [[ -n "$raw" ]] && printf '%s\n' "$raw" | tail -n 8 >&2
-    return 1
-  fi
-  if ! sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name='api_tokens';" 2>/dev/null | grep -q api_tokens; then
-    warn "В БД нет таблицы api_tokens (старая 3x-ui?). Сырой вывод CLI:"
-    [[ -n "$raw" ]] && printf '%s\n' "$raw" | tail -n 12 >&2
-    return 1
-  fi
-
-  tok=$(gen_alnum 48)
-  if command -v sha256sum >/dev/null 2>&1; then
-    hash=$(printf '%s' "$tok" | sha256sum | awk '{print $1}')
-  else
-    hash=$(printf '%s' "$tok" | openssl dgst -sha256 | awk '{print $NF}')
-  fi
-  now=$(date +%s)
-  sqlite3 "$db" "DELETE FROM api_tokens WHERE name='cli-fallback' OR name='harden-cli';
-INSERT INTO api_tokens (name, token, enabled, created_at, scope, expires_at)
-VALUES ('harden-cli', '${hash}', 1, ${now}, 'admin', 0);" || {
-    err "Не удалось записать API token в ${db}"
-    [[ -n "$raw" ]] && printf '%s\n' "$raw" | tail -n 8 >&2
-    return 1
-  }
-  XUI_API_TOKEN="$tok"
-  ok "API key создан в БД (harden-cli)"
-  return 0
-}
-
 reset_xui_credentials() {
   log "Сброс логина/пароля 3x-ui..."
   local bin out shown got_user
@@ -649,7 +564,6 @@ reset_xui_credentials() {
 
   XUI_USER=$(gen_alnum 12)
   XUI_PASS=$(gen_alnum 60)
-  XUI_API_TOKEN=""
 
   # Менять БД при работающей панели опасно (sqlite WAL) — сначала stop
   log "Останавливаю x-ui перед сменой credentials..."
@@ -658,7 +572,7 @@ reset_xui_credentials() {
   # Direct CLI (как x-ui.sh reset_user) + сброс 2FA
   out=$("$bin" setting -username "$XUI_USER" -password "$XUI_PASS" -resetTwoFactor=true 2>&1) || {
     err "Не удалось выполнить setting: $out"
-    XUI_USER=""; XUI_PASS=""; XUI_API_TOKEN=""
+    XUI_USER=""; XUI_PASS=""
     restart_xui_panel || true
     return 1
   }
@@ -668,13 +582,10 @@ reset_xui_credentials() {
   got_user=$(printf '%s\n' "$shown" | grep -iE 'username' | head -1 | awk -F'[=: ]+' '{print $NF}' | tr -d '[:space:]' || true)
   if [[ -n "$got_user" && "$got_user" != "$XUI_USER" ]]; then
     err "В БД username=${got_user}, ожидали ${XUI_USER} — credentials могли не сохраниться"
-    XUI_USER=""; XUI_PASS=""; XUI_API_TOKEN=""
+    XUI_USER=""; XUI_PASS=""
     restart_xui_panel || true
     return 1
   fi
-
-  # API key: CLI getApiToken (или создание hash в sqlite)
-  ensure_xui_api_token "$bin" || warn "API key не получен — см. сообщения выше"
 
   restart_xui_panel || true
   sleep 1
@@ -683,14 +594,9 @@ reset_xui_credentials() {
 
   if [[ "$RAN_ALL" -eq 0 ]]; then
     print_secret_once_banner
-    echo -e "${BOLD}3x-ui username:${NC}  ${XUI_USER}"
-    echo -e "${BOLD}3x-ui password:${NC}  ${XUI_PASS}"
-    if [[ -n "$XUI_API_TOKEN" ]]; then
-      echo -e "${BOLD}3x-ui api key:${NC}   ${XUI_API_TOKEN}"
-    else
-      echo -e "${BOLD}3x-ui api key:${NC}   ${RED}(не получен)${NC}"
-    fi
-    [[ -n "$XUI_URL" ]] && echo -e "${BOLD}3x-ui URL:${NC}       ${XUI_URL}"
+    echo -e "${BOLD}3x-ui username:${NC} ${XUI_USER}"
+    echo -e "${BOLD}3x-ui password:${NC} ${XUI_PASS}"
+    [[ -n "$XUI_URL" ]] && echo -e "${BOLD}3x-ui URL:${NC}      ${XUI_URL}"
     echo -e "${YELLOW}Логин/пароль только a-zA-Z0-9 — копируйте целиком, без пробелов.${NC}"
     echo
   fi
@@ -716,11 +622,6 @@ print_summary_once() {
   echo -e "PasswordAuth:      $(password_auth_status)"
   [[ -n "$XUI_USER" ]] && echo -e "3x-ui username:    ${XUI_USER}"
   [[ -n "$XUI_PASS" ]] && echo -e "3x-ui password:    ${XUI_PASS}"
-  if [[ -n "$XUI_API_TOKEN" ]]; then
-    echo -e "3x-ui api key:     ${XUI_API_TOKEN}"
-  elif [[ -n "$XUI_USER" ]]; then
-    echo -e "3x-ui api key:     (не получен)"
-  fi
   [[ -n "$XUI_URL" ]] && echo -e "3x-ui URL:         ${XUI_URL}"
   echo -e "${BOLD}====================================${NC}"
   echo
@@ -742,7 +643,7 @@ run_all() {
   reset_xui_credentials || true
   print_summary_once
   # Prevent accidental reprint if user continues in menu
-  ROOT_PASS=""; SYS_PASS=""; XUI_PASS=""; XUI_API_TOKEN=""
+  ROOT_PASS=""; SYS_PASS=""; XUI_PASS=""
   RAN_ALL=0
 }
 
@@ -790,7 +691,7 @@ main() {
       3) create_system_user; SYS_PASS=""; pause ;;
       4) change_ssh_port; pause ;;
       5) disable_password_auth; pause ;;
-      6) reset_xui_credentials; XUI_PASS=""; XUI_API_TOKEN=""; pause ;;
+      6) reset_xui_credentials; XUI_PASS=""; pause ;;
       *) err "Неверный выбор"; sleep 1 ;;
     esac
   done
