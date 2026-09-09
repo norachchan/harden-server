@@ -4,6 +4,8 @@
 
 set -euo pipefail
 
+SCRIPT_VERSION="2026.09.09-9"
+
 # ---------------------------------------------------------------------------
 # UI
 # ---------------------------------------------------------------------------
@@ -222,7 +224,6 @@ cleanup_ssh_socket_unit() {
 }
 
 # Explicit socket listen (belt-and-suspenders alongside Port in sshd_config).
-# Empty ListenStream= clears package defaults; then set the new port.
 write_ssh_socket_listen() {
   local port="$1"
   [[ -n "$port" ]] || return 0
@@ -235,12 +236,93 @@ write_ssh_socket_listen() {
 ListenStream=
 ListenStream=0.0.0.0:${port}
 ListenStream=[::]:${port}
+BindIPv6Only=ipv6-only
 EOF
 }
 
+clear_ssh_socket_listen() {
+  rm -f /etc/systemd/system/ssh.socket.d/listen.conf
+  rmdir /etc/systemd/system/ssh.socket.d 2>/dev/null || true
+}
+
 has_ssh_socket_unit() {
-  systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.socket' \
-    || [[ -f /lib/systemd/system/ssh.socket || -f /usr/lib/systemd/system/ssh.socket ]]
+  [[ -f /lib/systemd/system/ssh.socket || -f /usr/lib/systemd/system/ssh.socket ]] \
+    || systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.socket'
+}
+
+# Socket activation ONLY when sshd-socket-generator exists (Ubuntu 22.10/24.04+).
+# On Debian 11 ssh.socket may be enabled but dual ListenStream breaks with EADDRINUSE —
+# always use classic ssh.service there.
+prefer_ssh_socket_activation() {
+  [[ -x /usr/lib/systemd/system-generators/sshd-socket-generator ]] \
+    || [[ -x /lib/systemd/system-generators/sshd-socket-generator ]]
+}
+
+restart_ssh_via_service() {
+  local svc="$1" want_port="${2:-}"
+  log "Restart ${svc}.service (классический режим, без ssh.socket)..."
+  clear_ssh_socket_listen
+  # Stop socket so it cannot hold/conflict with Port from sshd_config
+  systemctl stop ssh.socket 2>/dev/null || true
+  systemctl stop sshd.socket 2>/dev/null || true
+  systemctl disable ssh.socket 2>/dev/null || true
+  systemctl disable sshd.socket 2>/dev/null || true
+  systemctl reset-failed ssh.socket 2>/dev/null || true
+  # Mask prevents socket from coming back via sockets.target / RequiredBy
+  systemctl mask ssh.socket 2>/dev/null || true
+  systemctl mask sshd.socket 2>/dev/null || true
+  systemctl daemon-reload 2>/dev/null || true
+  mkdir -p /run/sshd
+  chmod 755 /run/sshd
+  systemctl enable "$svc" 2>/dev/null || true
+  if ! systemctl restart "$svc"; then
+    # Some images tie ssh.service to ssh.socket — unmask and retry
+    warn "restart ${svc} не удался после mask socket — пробую без mask"
+    systemctl unmask ssh.socket 2>/dev/null || true
+    systemctl unmask sshd.socket 2>/dev/null || true
+    systemctl disable --now ssh.socket 2>/dev/null || true
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart "$svc" || {
+      err "Не удалось restart ${svc}.service"
+      systemctl status "$svc" --no-pager -l 2>/dev/null | tail -25 || true
+      return 1
+    }
+  fi
+  return 0
+}
+
+restart_ssh_via_socket() {
+  local svc="$1" want_port="$2"
+  log "Restart ssh.socket (Ubuntu generator / socket activation)..."
+  systemctl unmask ssh.socket 2>/dev/null || true
+  systemctl unmask sshd.socket 2>/dev/null || true
+  if [[ -n "$want_port" ]]; then
+    write_ssh_socket_listen "$want_port"
+  fi
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable ssh.socket 2>/dev/null || true
+  # Free binds: stop standalone sshd if it holds ports (KillMode=process keeps sessions)
+  systemctl stop "$svc" 2>/dev/null || true
+  systemctl reset-failed ssh.socket 2>/dev/null || true
+  if ! systemctl restart ssh.socket; then
+    warn "ssh.socket restart не удался — пробую IPv4-only ListenStream"
+    if [[ -n "$want_port" ]]; then
+      mkdir -p /etc/systemd/system/ssh.socket.d
+      cat >/etc/systemd/system/ssh.socket.d/listen.conf <<EOF
+[Socket]
+ListenStream=
+ListenStream=0.0.0.0:${want_port}
+EOF
+      systemctl daemon-reload 2>/dev/null || true
+      systemctl reset-failed ssh.socket 2>/dev/null || true
+      if systemctl restart ssh.socket; then
+        return 0
+      fi
+    fi
+    systemctl status ssh.socket --no-pager -l 2>/dev/null | tail -25 || true
+    return 1
+  fi
+  return 0
 }
 
 validate_sshd_config() {
@@ -265,7 +347,7 @@ validate_sshd_config() {
 # Hard apply sshd settings without rebooting the whole server
 apply_ssh_now() {
   local want_port="${1:-}"
-  local svc
+  local svc use_socket=0
   svc=$(ssh_service_name)
 
   cleanup_ssh_socket_unit
@@ -274,34 +356,21 @@ apply_ssh_now() {
     return 1
   }
 
-  if [[ -n "$want_port" ]] && has_ssh_socket_unit; then
-    write_ssh_socket_listen "$want_port"
+  if prefer_ssh_socket_activation; then
+    use_socket=1
   fi
 
-  systemctl daemon-reload 2>/dev/null || true
-
-  if has_ssh_socket_unit; then
-    # Ubuntu 24.04: listening port owned by ssh.socket (generator reads Port from sshd_config)
-    log "Restart ssh.socket (Ubuntu socket activation)..."
-    systemctl enable ssh.socket 2>/dev/null || true
-    if ! systemctl restart ssh.socket; then
-      err "Не удалось restart ssh.socket"
-      systemctl status ssh.socket --no-pager -l 2>/dev/null | tail -25 || true
-      return 1
+  if [[ "$use_socket" -eq 1 ]]; then
+    if ! restart_ssh_via_socket "$svc" "$want_port"; then
+      warn "Откат на классический ${svc}.service..."
+      restart_ssh_via_service "$svc" "$want_port" || return 1
+      use_socket=0
     fi
-    # Re-attach/restart daemon that may still hold the old port
-    systemctl try-restart "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
   else
-    log "Жёсткий restart ${svc}.service (не reload)..."
-    systemctl enable "$svc" 2>/dev/null || true
-    systemctl restart "$svc" || {
-      err "Не удалось restart ${svc}.service"
-      systemctl status "$svc" --no-pager -l 2>/dev/null | tail -25 || true
-      return 1
-    }
+    restart_ssh_via_service "$svc" "$want_port" || return 1
   fi
 
-  # Give daemon a moment to bind
+  # Give daemon/socket a moment to bind
   sleep 1
   local i
   for i in 1 2 3 4 5; do
@@ -315,13 +384,23 @@ apply_ssh_now() {
       return 0
     fi
     sleep 1
-    if has_ssh_socket_unit; then
+    if [[ "$use_socket" -eq 1 ]]; then
       systemctl restart ssh.socket 2>/dev/null || true
-      systemctl try-restart "$svc" 2>/dev/null || true
     else
       systemctl restart "$svc" 2>/dev/null || true
     fi
   done
+
+  # Last resort: classic service if socket path didn't bind the port
+  if [[ -n "$want_port" && "$use_socket" -eq 1 ]] && ! ssh_listening_on_port "$want_port"; then
+    warn "Порт не слушается через socket — финальный откат на ${svc}.service"
+    restart_ssh_via_service "$svc" "$want_port" || true
+    sleep 1
+    if ssh_listening_on_port "$want_port"; then
+      ok "SSH слушает TCP ${want_port} (через ${svc}.service)"
+      return 0
+    fi
+  fi
 
   if [[ -n "$want_port" ]] && ! ssh_listening_on_port "$want_port"; then
     err "После restart порт ${want_port} всё ещё не слушается"
@@ -358,32 +437,143 @@ ensure_ssh_setting() {
   fi
 }
 
+# List nft input-hook chains: "family table chain" per line
+nft_list_input_chains() {
+  local json
+  if command -v python3 >/dev/null 2>&1; then
+    json=$(nft -j list ruleset 2>/dev/null || true)
+    if [[ -n "$json" ]]; then
+      printf '%s' "$json" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for item in data.get("nftables", []):
+    c = item.get("chain")
+    if not c:
+        continue
+    if c.get("hook") == "input":
+        print(c.get("family", ""), c.get("table", ""), c.get("name", ""))
+' 2>/dev/null && return 0
+    fi
+  fi
+  # Fallback: walk tables/chains via text
+  local fam table
+  while read -r _ fam table; do
+    [[ "$fam" == "ip" || "$fam" == "ip6" || "$fam" == "inet" || "$fam" == "bridge" || "$fam" == "netdev" ]] || continue
+    [[ -n "$table" ]] || continue
+    nft list table "$fam" "$table" 2>/dev/null | awk -v fam="$fam" -v table="$table" '
+      /^[[:space:]]*chain[[:space:]]+/ { chain=$2; gsub(/[{]/,"",chain); input=0; next }
+      chain != "" && /hook[[:space:]]+input/ { input=1 }
+      chain != "" && input == 1 && /^[[:space:]]*\}/ { print fam, table, chain; chain=""; input=0; next }
+      chain != "" && /^[[:space:]]*\}/ { chain=""; input=0 }
+    '
+  done < <(nft list tables 2>/dev/null)
+}
+
+nft_open_tcp_port() {
+  local port="$1" opened=0
+  local fam table chain has_tables=0 has_input=0
+
+  command -v nft >/dev/null 2>&1 || return 1
+
+  if nft list tables 2>/dev/null | grep -q .; then
+    has_tables=1
+  fi
+
+  # Нет таблиц = нет локального nft-firewall (всё accept по умолчанию)
+  if [[ "$has_tables" -eq 0 ]]; then
+    ok "nftables: таблиц нет — локальный drop-firewall не активен"
+    return 0
+  fi
+
+  while IFS= read -r fam table chain; do
+    [[ -n "$fam" && -n "$table" && -n "$chain" ]] || continue
+    has_input=1
+    if nft list chain "$fam" "$table" "$chain" 2>/dev/null \
+      | grep -Eq "dport (= )?${port}[[:space:]].*accept|accept.*dport (= )?${port}"; then
+      ok "nftables: TCP ${port} уже accept (${fam} ${table} ${chain})"
+      opened=1
+      continue
+    fi
+    if nft insert rule "$fam" "$table" "$chain" tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null \
+      || nft add rule "$fam" "$table" "$chain" tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null \
+      || nft insert rule "$fam" "$table" "$chain" meta l4proto tcp tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null; then
+      ok "nftables: accept TCP ${port} → ${fam} ${table} ${chain}"
+      opened=1
+    else
+      warn "nftables: не удалось добавить правило в ${fam} ${table} ${chain}"
+    fi
+  done < <(nft_list_input_chains)
+
+  if [[ "$has_input" -eq 0 ]]; then
+    # Таблицы есть, но input-hook не найден — пробуем создать свою цепочку (опасно менять policy).
+    # Вместо этого: добавить отдельную таблицу harden-ssh только с accept (не drop).
+    if nft add table inet harden-ssh 2>/dev/null \
+      && nft add chain inet harden-ssh input '{ type filter hook input priority -10; policy accept; }' 2>/dev/null \
+      && nft add rule inet harden-ssh input tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null; then
+      ok "nftables: создана таблица harden-ssh, accept TCP ${port}"
+      opened=1
+    else
+      warn "nftables: input-hook не найден. Таблицы:"
+      nft list tables 2>/dev/null | sed 's/^/  /' >&2 || true
+    fi
+  fi
+
+  [[ "$opened" -eq 1 ]]
+}
+
 open_firewall_port() {
-  local port="$1"
+  local port="$1" opened=0
+
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
     ufw allow "${port}/tcp" comment 'harden-ssh' >/dev/null || true
     ok "UFW: разрешён TCP ${port}"
-    return
+    opened=1
   fi
+
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
     firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null || true
     firewall-cmd --reload >/dev/null || true
     ok "firewalld: разрешён TCP ${port}"
-    return
+    opened=1
   fi
-  if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q 'hook input'; then
-    # Best-effort: do not invent complex nft policy; just inform
-    warn "Обнаружен nftables. Убедитесь, что TCP ${port} открыт вручную при необходимости."
-    return
+
+  # Попробовать поставить iptables-nft, если бинарника нет
+  if ! command -v iptables >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables >/dev/null 2>&1 || true
   fi
+
   if command -v iptables >/dev/null 2>&1; then
     if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
       ok "iptables: TCP ${port} уже разрешён"
-    else
-      iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || true
+      opened=1
+    elif iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
       ok "iptables: добавлен ACCEPT TCP ${port}"
+      opened=1
+      if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+      elif [[ -d /etc/iptables ]]; then
+        iptables-save >/etc/iptables/rules.v4 2>/dev/null || true
+      fi
     fi
   fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    if ! ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+      ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
+  fi
+
+  if nft_open_tcp_port "$port"; then
+    opened=1
+  fi
+
+  if [[ "$opened" -eq 0 ]]; then
+    warn "Локальный firewall: правило для TCP ${port} не добавлено."
+    warn "Диагностика: nft list tables; nft list ruleset | head -n 80"
+  fi
+  warn "Обязательно откройте TCP ${port} во внешней панели хостинга / Security Group."
 }
 
 print_secret_once_banner() {
@@ -501,8 +691,9 @@ change_ssh_port() {
     warn "sshd -T показывает port=${effective}; слушающий порт проверен через ss"
   fi
 
-  ok "SSH порт применён без reboot: ${SSH_PORT_NEW} (старый 22 не закрывался фаерволом)"
-  warn "Проверьте вход на новом порту во второй сессии, прежде чем закрывать текущую."
+  ok "SSH порт применён: ${SSH_PORT_NEW}"
+  warn "Проверьте вход: ssh -p ${SSH_PORT_NEW} debian@IP (ключ). Откройте TCP ${SSH_PORT_NEW} в панели хостинга."
+  warn "Порт 22 скрипт не оставляет как fallback — закройте 22 в firewall/панели после проверки."
 
   if [[ "$RAN_ALL" -eq 0 ]]; then
     print_secret_once_banner
@@ -593,24 +784,79 @@ read_xui_url_hint() {
   fi
 }
 
-restart_xui_panel() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
-    systemctl restart x-ui
-    return $?
+ensure_xui_systemd_unit() {
+  if systemctl cat x-ui.service >/dev/null 2>&1; then
+    return 0
   fi
-  if command -v x-ui >/dev/null 2>&1; then
-    # non-interactive restart if menu script supports it poorly — try systemctl only
-    warn "systemctl unit x-ui не найден — перезапустите панель вручную"
-    return 1
+  local src
+  for src in \
+    /etc/systemd/system/x-ui.service \
+    /usr/local/x-ui/x-ui.service \
+    /usr/local/x-ui/x-ui.service.debian \
+    /lib/systemd/system/x-ui.service
+  do
+    [[ -f "$src" ]] || continue
+    if [[ "$src" != /etc/systemd/system/x-ui.service ]]; then
+      cp -f "$src" /etc/systemd/system/x-ui.service
+      systemctl daemon-reload 2>/dev/null || true
+    fi
+    systemctl cat x-ui.service >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+xui_pids() {
+  pgrep -f '^/usr/local/x-ui/x-ui( |$)' 2>/dev/null || pgrep -x x-ui 2>/dev/null || true
+}
+
+stop_xui_panel() {
+  if ensure_xui_systemd_unit; then
+    systemctl stop x-ui 2>/dev/null || true
+    sleep 1
+    if [[ -z "$(xui_pids)" ]]; then
+      return 0
+    fi
+  fi
+  local pids
+  pids=$(xui_pids)
+  if [[ -n "$pids" ]]; then
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    sleep 2
+    pids=$(xui_pids)
+    if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086
+      kill -KILL $pids 2>/dev/null || true
+      sleep 1
+    fi
+    [[ -z "$(xui_pids)" ]] && return 0
   fi
   return 1
 }
 
-stop_xui_panel() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
-    systemctl stop x-ui || true
+restart_xui_panel() {
+  if ensure_xui_systemd_unit; then
+    systemctl enable x-ui >/dev/null 2>&1 || true
+    if systemctl restart x-ui 2>/dev/null; then
+      ok "x-ui.service перезапущен"
+      return 0
+    fi
+    systemctl start x-ui 2>/dev/null && ok "x-ui.service запущен" && return 0
+  fi
+
+  # Fallback: прямой запуск бинарника
+  if [[ -x /usr/local/x-ui/x-ui ]]; then
+    stop_xui_panel || true
+    nohup /usr/local/x-ui/x-ui >/var/log/x-ui-harden.log 2>&1 &
     sleep 1
-    return 0
+    if [[ -n "$(xui_pids)" ]]; then
+      ok "x-ui запущен напрямую (unit systemd отсутствовал)"
+      return 0
+    fi
+  fi
+
+  if command -v x-ui >/dev/null 2>&1; then
+    warn "Не удалось перезапустить x-ui автоматически — выполните: systemctl restart x-ui || /usr/local/x-ui/x-ui"
   fi
   return 1
 }
@@ -730,7 +976,7 @@ show_menu() {
 ╚────────────────────────────────────────────────╝
 EOF
   echo -e "${NC}"
-  echo -e "OS: ${os_pretty}"
+  echo -e "OS: ${os_pretty}  |  script: ${SCRIPT_VERSION}"
   echo -e "${YELLOW}Секреты показываются один раз и никуда не сохраняются.${NC}"
   echo
 }
