@@ -201,26 +201,46 @@ ssh_listening_on_port() {
   fi
 }
 
-# Port changes require full restart. Also disable socket activation (ssh.socket),
-# otherwise systemd keeps listening on :22 and ignores Port in sshd_config until reboot.
-disable_ssh_socket_activation() {
-  local sock
-  for sock in ssh.socket sshd.socket; do
-    if systemctl list-unit-files 2>/dev/null | grep -qE "^${sock}"; then
-      log "Отключаю ${sock} (socket activation мешает смене Port)..."
-      systemctl stop "$sock" 2>/dev/null || true
-      systemctl disable "$sock" 2>/dev/null || true
-      systemctl mask "$sock" 2>/dev/null || true
-    fi
+# Ubuntu 24.04+: ssh.socket + sshd-socket-generator. Empty ListenStream-only
+# override / mask breaks the unit ("bad unit file setting") and blocks ssh.service.
+cleanup_ssh_socket_unit() {
+  local f d
+  for d in /etc/systemd/system/ssh.socket.d /etc/systemd/system/sshd.socket.d; do
+    [[ -d "$d" ]] || continue
+    for f in "$d"/*.conf; do
+      [[ -f "$f" ]] || continue
+      # Drop broken overrides that only clear ListenStream (no new port)
+      if grep -qE '^\s*ListenStream\s*=' "$f" && ! grep -qE '^\s*ListenStream\s*=\s*\S+' "$f"; then
+        warn "Удаляю сломанный override: $f"
+        rm -f "$f"
+      fi
+    done
+    rmdir "$d" 2>/dev/null || true
   done
-  # Drop-in overrides for ListenStream if socket somehow re-enabled later
-  if [[ -f /lib/systemd/system/ssh.socket ]] || [[ -f /usr/lib/systemd/system/ssh.socket ]]; then
-    mkdir -p /etc/systemd/system/ssh.socket.d
-    cat >/etc/systemd/system/ssh.socket.d/override.conf <<EOF
+  systemctl unmask ssh.socket 2>/dev/null || true
+  systemctl unmask sshd.socket 2>/dev/null || true
+}
+
+# Explicit socket listen (belt-and-suspenders alongside Port in sshd_config).
+# Empty ListenStream= clears package defaults; then set the new port.
+write_ssh_socket_listen() {
+  local port="$1"
+  [[ -n "$port" ]] || return 0
+  if [[ ! -f /lib/systemd/system/ssh.socket && ! -f /usr/lib/systemd/system/ssh.socket ]]; then
+    return 0
+  fi
+  mkdir -p /etc/systemd/system/ssh.socket.d
+  cat >/etc/systemd/system/ssh.socket.d/listen.conf <<EOF
 [Socket]
 ListenStream=
+ListenStream=0.0.0.0:${port}
+ListenStream=[::]:${port}
 EOF
-  fi
+}
+
+has_ssh_socket_unit() {
+  systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.socket' \
+    || [[ -f /lib/systemd/system/ssh.socket || -f /usr/lib/systemd/system/ssh.socket ]]
 }
 
 validate_sshd_config() {
@@ -243,18 +263,38 @@ apply_ssh_now() {
   local svc
   svc=$(ssh_service_name)
 
-  disable_ssh_socket_activation
+  cleanup_ssh_socket_unit
   validate_sshd_config || {
     err "sshd_config невалиден — SSH не перезапускаю"
     return 1
   }
 
+  if [[ -n "$want_port" ]] && has_ssh_socket_unit; then
+    write_ssh_socket_listen "$want_port"
+  fi
+
   systemctl daemon-reload 2>/dev/null || true
 
-  # Prefer restart over reload: Port / Auth changes often ignored by SIGHUP/reload
-  log "Жёсткий restart ${svc}.service (не reload)..."
-  systemctl enable "$svc" 2>/dev/null || true
-  systemctl restart "$svc"
+  if has_ssh_socket_unit; then
+    # Ubuntu 24.04: listening port owned by ssh.socket (generator reads Port from sshd_config)
+    log "Restart ssh.socket (Ubuntu socket activation)..."
+    systemctl enable ssh.socket 2>/dev/null || true
+    if ! systemctl restart ssh.socket; then
+      err "Не удалось restart ssh.socket"
+      systemctl status ssh.socket --no-pager -l 2>/dev/null | tail -25 || true
+      return 1
+    fi
+    # Re-attach/restart daemon that may still hold the old port
+    systemctl try-restart "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+  else
+    log "Жёсткий restart ${svc}.service (не reload)..."
+    systemctl enable "$svc" 2>/dev/null || true
+    systemctl restart "$svc" || {
+      err "Не удалось restart ${svc}.service"
+      systemctl status "$svc" --no-pager -l 2>/dev/null | tail -25 || true
+      return 1
+    }
+  fi
 
   # Give daemon a moment to bind
   sleep 1
@@ -265,18 +305,24 @@ apply_ssh_now() {
         ok "SSH слушает TCP ${want_port}"
         return 0
       fi
-    elif systemctl is-active --quiet "$svc"; then
-      ok "${svc} active"
+    elif systemctl is-active --quiet "$svc" || systemctl is-active --quiet ssh.socket; then
+      ok "SSH active"
       return 0
     fi
     sleep 1
-    systemctl restart "$svc" 2>/dev/null || true
+    if has_ssh_socket_unit; then
+      systemctl restart ssh.socket 2>/dev/null || true
+      systemctl try-restart "$svc" 2>/dev/null || true
+    else
+      systemctl restart "$svc" 2>/dev/null || true
+    fi
   done
 
   if [[ -n "$want_port" ]] && ! ssh_listening_on_port "$want_port"; then
     err "После restart порт ${want_port} всё ещё не слушается"
+    systemctl status ssh.socket --no-pager -l 2>/dev/null | tail -20 || true
     systemctl status "$svc" --no-pager -l 2>/dev/null | tail -20 || true
-    ss -tlnp | grep -E 'ssh|sshd' || true
+    ss -tlnp | grep -E 'ssh|sshd|:22|:'"$want_port" || true
     return 1
   fi
   return 0
@@ -408,12 +454,23 @@ create_system_user() {
 
 change_ssh_port() {
   log "Смена SSH-порта..."
-  local port
+  local port f
   port=$(pick_free_ssh_port) || {
     err "Не удалось подобрать свободный порт"
     return 1
   }
   SSH_PORT_NEW="$port"
+
+  # Comment Port in other drop-ins so 99-harden.conf applies cleanly
+  if [[ -d /etc/ssh/sshd_config.d ]]; then
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+      [[ -f "$f" ]] || continue
+      [[ "$(basename "$f")" == "99-harden.conf" ]] && continue
+      if grep -Eq '^[[:space:]]*Port[[:space:]]+' "$f"; then
+        sed -i -E 's/^[[:space:]]*Port[[:space:]].*/#&/I' "$f" || true
+      fi
+    done
+  fi
 
   ensure_ssh_setting Port "$SSH_PORT_NEW"
   # Also force Port in main file if Include is missing / ignored
@@ -429,15 +486,14 @@ change_ssh_port() {
 
   if ! apply_ssh_now "$SSH_PORT_NEW"; then
     err "Порт в конфиге записан (${SSH_PORT_NEW}), но сервис не слушает его"
+    warn "Текущая SSH-сессия обычно продолжает работать. Не закрывайте её."
     return 1
   fi
 
-  # Effective port from running daemon
   local effective
   effective=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)
   if [[ -n "$effective" && "$effective" != "$SSH_PORT_NEW" ]]; then
-    err "sshd -T показывает port=${effective}, ожидали ${SSH_PORT_NEW}"
-    return 1
+    warn "sshd -T показывает port=${effective}; слушающий порт проверен через ss"
   fi
 
   ok "SSH порт применён без reboot: ${SSH_PORT_NEW} (старый 22 не закрывался фаерволом)"
