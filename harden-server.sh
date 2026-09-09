@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.09-6"
+SCRIPT_VERSION="2026.09.09-7"
 
 # ---------------------------------------------------------------------------
 # UI
@@ -784,24 +784,79 @@ read_xui_url_hint() {
   fi
 }
 
-restart_xui_panel() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
-    systemctl restart x-ui
-    return $?
+ensure_xui_systemd_unit() {
+  if systemctl cat x-ui.service >/dev/null 2>&1; then
+    return 0
   fi
-  if command -v x-ui >/dev/null 2>&1; then
-    # non-interactive restart if menu script supports it poorly — try systemctl only
-    warn "systemctl unit x-ui не найден — перезапустите панель вручную"
-    return 1
+  local src
+  for src in \
+    /etc/systemd/system/x-ui.service \
+    /usr/local/x-ui/x-ui.service \
+    /usr/local/x-ui/x-ui.service.debian \
+    /lib/systemd/system/x-ui.service
+  do
+    [[ -f "$src" ]] || continue
+    if [[ "$src" != /etc/systemd/system/x-ui.service ]]; then
+      cp -f "$src" /etc/systemd/system/x-ui.service
+      systemctl daemon-reload 2>/dev/null || true
+    fi
+    systemctl cat x-ui.service >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+xui_pids() {
+  pgrep -f '^/usr/local/x-ui/x-ui( |$)' 2>/dev/null || pgrep -x x-ui 2>/dev/null || true
+}
+
+stop_xui_panel() {
+  if ensure_xui_systemd_unit; then
+    systemctl stop x-ui 2>/dev/null || true
+    sleep 1
+    if [[ -z "$(xui_pids)" ]]; then
+      return 0
+    fi
+  fi
+  local pids
+  pids=$(xui_pids)
+  if [[ -n "$pids" ]]; then
+    # shellcheck disable=SC2086
+    kill -TERM $pids 2>/dev/null || true
+    sleep 2
+    pids=$(xui_pids)
+    if [[ -n "$pids" ]]; then
+      # shellcheck disable=SC2086
+      kill -KILL $pids 2>/dev/null || true
+      sleep 1
+    fi
+    [[ -z "$(xui_pids)" ]] && return 0
   fi
   return 1
 }
 
-stop_xui_panel() {
-  if systemctl list-unit-files 2>/dev/null | grep -q '^x-ui\.service'; then
-    systemctl stop x-ui || true
+restart_xui_panel() {
+  if ensure_xui_systemd_unit; then
+    systemctl enable x-ui >/dev/null 2>&1 || true
+    if systemctl restart x-ui 2>/dev/null; then
+      ok "x-ui.service перезапущен"
+      return 0
+    fi
+    systemctl start x-ui 2>/dev/null && ok "x-ui.service запущен" && return 0
+  fi
+
+  # Fallback: прямой запуск бинарника
+  if [[ -x /usr/local/x-ui/x-ui ]]; then
+    stop_xui_panel || true
+    nohup /usr/local/x-ui/x-ui >/var/log/x-ui-harden.log 2>&1 &
     sleep 1
-    return 0
+    if [[ -n "$(xui_pids)" ]]; then
+      ok "x-ui запущен напрямую (unit systemd отсутствовал)"
+      return 0
+    fi
+  fi
+
+  if command -v x-ui >/dev/null 2>&1; then
+    warn "Не удалось перезапустить x-ui автоматически — выполните: systemctl restart x-ui || /usr/local/x-ui/x-ui"
   fi
   return 1
 }
