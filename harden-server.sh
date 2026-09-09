@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-SCRIPT_VERSION="2026.09.09-3"
+SCRIPT_VERSION="2026.09.09-4"
 
 # ---------------------------------------------------------------------------
 # UI
@@ -439,31 +439,73 @@ ensure_ssh_setting() {
 }
 
 open_firewall_port() {
-  local port="$1"
+  local port="$1" opened=0
+  local fam table chain line
+
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
     ufw allow "${port}/tcp" comment 'harden-ssh' >/dev/null || true
     ok "UFW: разрешён TCP ${port}"
-    return
+    opened=1
   fi
+
   if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld 2>/dev/null; then
     firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null || true
     firewall-cmd --reload >/dev/null || true
     ok "firewalld: разрешён TCP ${port}"
-    return
+    opened=1
   fi
-  if command -v nft >/dev/null 2>&1 && nft list ruleset 2>/dev/null | grep -q 'hook input'; then
-    # Best-effort: do not invent complex nft policy; just inform
-    warn "Обнаружен nftables. Убедитесь, что TCP ${port} открыт вручную при необходимости."
-    return
-  fi
+
+  # iptables / iptables-nft — всегда пробуем (раньше nft-ветка делала return и блокировала это)
   if command -v iptables >/dev/null 2>&1; then
     if iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
       ok "iptables: TCP ${port} уже разрешён"
-    else
-      iptables -I INPUT -p tcp --dport "$port" -j ACCEPT || true
+      opened=1
+    elif iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
       ok "iptables: добавлен ACCEPT TCP ${port}"
+      opened=1
+      if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+      elif [[ -d /etc/iptables ]]; then
+        iptables-save >/etc/iptables/rules.v4 2>/dev/null || true
+      fi
     fi
   fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    if ! ip6tables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null; then
+      ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+    fi
+  fi
+
+  # Прямой nft insert в известные input-цепочки
+  if command -v nft >/dev/null 2>&1; then
+    for line in \
+      "inet filter input" \
+      "inet filter INPUT" \
+      "ip filter INPUT" \
+      "ip filter input" \
+      "ip6 filter INPUT" \
+      "ip6 filter input"
+    do
+      # shellcheck disable=SC2086
+      set -- $line
+      fam=$1; table=$2; chain=$3
+      nft list chain "$fam" "$table" "$chain" >/dev/null 2>&1 || continue
+      if nft list chain "$fam" "$table" "$chain" 2>/dev/null | grep -Eq "tcp dport (= )?${port} .*accept|dport ${port} accept"; then
+        ok "nftables: TCP ${port} уже в ${fam} ${table} ${chain}"
+        opened=1
+        continue
+      fi
+      if nft insert rule "$fam" "$table" "$chain" tcp dport "$port" accept comment "harden-ssh-${port}" 2>/dev/null; then
+        ok "nftables: accept TCP ${port} → ${fam} ${table} ${chain}"
+        opened=1
+      fi
+    done
+  fi
+
+  if [[ "$opened" -eq 0 ]]; then
+    warn "Локальный firewall: правило для TCP ${port} не добавлено автоматически."
+  fi
+  warn "Если порт снаружи недоступен — откройте TCP ${port} в панели хостинга / Security Group."
 }
 
 print_secret_once_banner() {
