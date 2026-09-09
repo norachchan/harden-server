@@ -22,9 +22,30 @@ err()  { echo -e "${RED}[ERR]${NC}  $*" >&2; }
 
 require_root() {
   if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
-    err "Запустите от root: sudo bash $0"
+    err "Запустите от root: bash $0"
+    err "Если есть sudo: sudo bash $0"
     exit 1
   fi
+}
+
+ensure_sudo_installed() {
+  if command -v sudo >/dev/null 2>&1; then
+    return 0
+  fi
+  log "Пакет sudo не найден — устанавливаю..."
+  if command -v apt-get >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 || true
+    if DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo >/dev/null 2>&1; then
+      ok "sudo установлен"
+      return 0
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y sudo >/dev/null 2>&1 && ok "sudo установлен" && return 0
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y sudo >/dev/null 2>&1 && ok "sudo установлен" && return 0
+  fi
+  warn "Не удалось установить sudo автоматически — поставьте вручную: apt-get install -y sudo"
+  return 1
 }
 
 pause() {
@@ -329,6 +350,8 @@ create_system_user() {
   SYS_USER=$(detect_os_user)
   log "Системный пользователь: ${SYS_USER}"
 
+  ensure_sudo_installed || true
+
   if id "$SYS_USER" >/dev/null 2>&1; then
     warn "Пользователь ${SYS_USER} уже существует — обновляю пароль/группы"
   else
@@ -338,8 +361,20 @@ create_system_user() {
 
   if getent group sudo >/dev/null 2>&1; then
     usermod -aG sudo "$SYS_USER"
+    ok "${SYS_USER} добавлен в группу sudo"
   elif getent group wheel >/dev/null 2>&1; then
     usermod -aG wheel "$SYS_USER"
+    ok "${SYS_USER} добавлен в группу wheel"
+  else
+    warn "Группа sudo/wheel не найдена — пользователь без прав повышения привилегий"
+  fi
+
+  # Passwordless-less NOPASSWD not set; ensure sudoers.d allows group if needed
+  if [[ -d /etc/sudoers.d ]] && getent group sudo >/dev/null 2>&1; then
+    if [[ ! -f /etc/sudoers.d/90-harden-sudo ]]; then
+      printf '%%sudo ALL=(ALL:ALL) ALL\n' >/etc/sudoers.d/90-harden-sudo
+      chmod 440 /etc/sudoers.d/90-harden-sudo
+    fi
   fi
 
   # Ensure unique password vs root
